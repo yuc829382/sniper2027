@@ -1,360 +1,501 @@
-import re
-from datetime import datetime
+import os
+import numpy as np
 import pandas as pd
 import plotly.express as px
-import requests
+import plotly.graph_objects as go
 import streamlit as st
-from bs4 import BeautifulSoup
 
+# =========================================================
+# Page Config & Design System
+# =========================================================
 st.set_page_config(
-    page_title="2027 정시 스나이퍼 v2",
+    page_title="2027 정시 전략 시뮬레이터 v3 (19개 대학 2026 최신입결)",
     page_icon="🎯",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# ---------------------------------------------------------
-# 0. 간단 비밀번호 잠금 (Public 저장소 보안용)
-# ---------------------------------------------------------
-ACCESS_PIN = "2027"  # 원하시는 비밀번호로 변경 가능
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 1.85rem;
+        font-weight: 800;
+        color: #0F172A;
+        letter-spacing: -0.02em;
+        margin-bottom: 0.25rem;
+    }
+    .sub-header {
+        font-size: 0.95rem;
+        color: #475569;
+        margin-bottom: 1.25rem;
+    }
+    .kpi-card {
+        background: #F8FAFC;
+        border: 1px solid #E2E8F0;
+        border-radius: 12px;
+        padding: 14px 18px;
+    }
+    .kpi-label {
+        font-size: 0.80rem;
+        color: #64748B;
+        font-weight: 600;
+        margin-bottom: 4px;
+    }
+    .kpi-value {
+        font-size: 1.45rem;
+        color: #0F172A;
+        font-weight: 800;
+    }
+    .kpi-sub {
+        font-size: 0.76rem;
+        color: #475569;
+        margin-top: 2px;
+    }
+    .badge-info {
+        background-color: #EFF6FF;
+        border-left: 4px solid #2563EB;
+        padding: 10px 14px;
+        border-radius: 6px;
+        font-size: 0.88rem;
+        color: #1E3A8A;
+        margin-bottom: 12px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
+# =========================================================
+# Data Loading
+# =========================================================
+DEFAULT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "univ_2026_master.csv")
 
-if not st.session_state.authenticated:
-    st.title("🔒 2027 정시 스나이퍼 v2")
-    pin_input = st.text_input("접속 비밀번호를 입력하세요", type="password", placeholder="기본값: 2027")
-    if st.button("잠금 해제", type="primary"):
-        if pin_input == ACCESS_PIN:
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("비밀번호가 일치하지 않습니다.")
+@st.cache_data
+def load_master_data(file_bytes=None):
+    if file_bytes is not None:
+        df = pd.read_csv(file_bytes)
+    elif os.path.exists(DEFAULT_CSV):
+        df = pd.read_csv(DEFAULT_CSV)
+    else:
+        return pd.DataFrame()
+
+    num_cols = [
+        "모집인원", "경쟁률", "충원순위", "충원율", "백분위_70컷_2026",
+        "환산점수_70컷", "영어_등급평균", "탐구_반영과목수",
+        "국어_비중", "수학_비중", "탐구_비중", "영어_비중",
+        "백분위_70컷_2025", "백분위_70컷_2024", "백분위_70컷_2023",
+        "백분위_70컷_2022", "백분위_70컷_2021", "전년대비_변화"
+    ]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+# =========================================================
+# Scoring & Classification Engine
+# =========================================================
+ENG_PENALTY_DEFAULT = {1: 0.0, 2: -0.4, 3: -1.3, 4: -3.0, 5: -5.5, 6: -8.5, 7: -12.0, 8: -16.0, 9: -20.0}
+
+def compute_personalized_scores(df, kor, math, tam1, tam2, eng_grade, math_sel, tam_type, apply_bonus, apply_eng):
+    out = df.copy()
+    tam_avg2 = (tam1 + tam2) / 2.0
+    tam_best1 = max(tam1, tam2)
+
+    # 1) 대학별 탐구 반영과목수 적용 (1과목 vs 2과목)
+    tam_applied = np.where(out["탐구_반영과목수"] == 1, tam_best1, tam_avg2)
+
+    # 2) 국·수·탐 정규화 가중평균
+    w_sum = out["국어_비중"] + out["수학_비중"] + out["탐구_비중"]
+    w_kor = out["국어_비중"] / w_sum
+    w_math = out["수학_비중"] / w_sum
+    w_tam = out["탐구_비중"] / w_sum
+
+    base_score = w_kor * kor + w_math * math + w_tam * tam_applied
+
+    # 3) 자연/의약학 계열 미적·기하 / 과탐 가산점 체감 보정
+    bonus = np.zeros(len(out))
+    if apply_bonus:
+        is_sci_track = out["계열"].isin(["자연", "의약학/보건"])
+        if math_sel == "미적분/기하":
+            bonus += np.where(is_sci_track, 1.2, 0.0)
+        if tam_type == "과학탐구":
+            bonus += np.where(is_sci_track, 1.0, 0.0)
+
+    # 4) 영어 등급 영향력 보정 (대학 영어 평균등급 대비 유불리 + 기본 감점)
+    eng_adj = np.zeros(len(out))
+    if apply_eng:
+        base_pen = ENG_PENALTY_DEFAULT.get(eng_grade, -3.0)
+        # 영어 비중이 높거나(0.20 이상) 평균등급이 공개된 경우 상대 보정
+        eng_weight_scale = out["영어_비중"] / 0.20
+        eng_adj = base_pen * np.clip(eng_weight_scale, 0.5, 1.2)
+
+    out["내_맞춤_백분위"] = (base_score + bonus + eng_adj).clip(0, 100).round(2)
+    out["격차"] = (out["내_맞춤_백분위"] - out["백분위_70컷_2026"]).round(2)
+
+    def judge(gap):
+        if pd.isna(gap): return "⚪ 판정불가"
+        if gap >= 2.5: return "🟢 안정"
+        if gap >= 0.5: return "🔵 적정"
+        if gap >= -1.5: return "🟡 소신"
+        if gap >= -4.0: return "🟠 상향"
+        return "🔴 위험"
+
+    out["지원_판정"] = out["격차"].apply(judge)
+    return out
+
+TIER_COLORS = {
+    "🟢 안정": "#16A34A",
+    "🔵 적정": "#2563EB",
+    "🟡 소신": "#D97706",
+    "🟠 상향": "#EA580C",
+    "🔴 위험": "#DC2626",
+    "⚪ 판정불가": "#94A3B8",
+}
+
+# =========================================================
+# Sidebar: Student CSAT Input & Options
+# =========================================================
+with st.sidebar:
+    st.markdown("### 📝 내 수능/모의고사 성적 입력")
+    kor_pct = st.number_input("국어 백분위", min_value=0.0, max_value=100.0, value=83.0, step=0.5)
+    math_pct = st.number_input("수학 백분위", min_value=0.0, max_value=100.0, value=85.0, step=0.5)
+    math_sel = st.radio("수학 선택과목", ["미적분/기하", "확률과통계"], horizontal=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        tam1_pct = st.number_input("탐구1 백분위", min_value=0.0, max_value=100.0, value=88.0, step=0.5)
+    with c2:
+        tam2_pct = st.number_input("탐구2 백분위", min_value=0.0, max_value=100.0, value=74.0, step=0.5)
+    tam_type = st.radio("탐구 응시유형", ["과학탐구", "사회탐구", "사탐+과탐"], horizontal=True)
+
+    eng_grade = st.selectbox("영어 등급", [1, 2, 3, 4, 5, 6, 7, 8, 9], index=1)
+    hist_grade = st.selectbox("한국사 등급", [1, 2, 3, 4, 5, 6, 7, 8, 9], index=1)
+
+    st.divider()
+    st.markdown("### ⚙️ 정밀 보정 옵션")
+    apply_bonus = st.checkbox("자연계 미적·기하/과탐 가산점 체감 반영", value=True)
+    apply_eng = st.checkbox("영어 등급 감점 체감 반영", value=True)
+
+    st.divider()
+    st.markdown("### 📂 데이터 파일 교체(선택)")
+    uploaded_csv = st.file_uploader("커스텀 `univ_2026_master.csv` 업로드", type=["csv"])
+
+raw_df = load_master_data(uploaded_csv)
+
+if raw_df.empty:
+    st.error("`univ_2026_master.csv` 파일을 찾을 수 없습니다. `app_v3.py`와 같은 폴더에 배치하거나 사이드바에서 CSV를 업로드해 주세요.")
     st.stop()
 
-# ---------------------------------------------------------
-# 1. 20개 대학 정예 학과 DB (2026 입결 + 2027 실제 공식 매핑)
-# ---------------------------------------------------------
-@st.cache_data
-def load_v2_targets():
-    data = [
-        # Tier 1: 상향 스나이핑 (숭실·단국·인하·아주·국민·광운·과기대·외대글로벌)
-        ("Tier 1 (상향 스나이핑)", "다군", "서울과기대", "ST자유전공학부", "std_nat", 84.5, 9.40, 145.0, "20명 모집 충원 145%, 다군 폭풍 추합"),
-        ("Tier 1 (상향 스나이핑)", "가군", "서울과기대", "환경공학과", "std_nat", 82.0, 4.80, 92.0, "26명 모집 충원 92%, 수35·탐25"),
-        ("Tier 1 (상향 스나이핑)", "가/나", "숭실대", "사회복지학부", "ssu_hum", 83.5, 5.50, 85.0, "2027 영2=1등급 만점 동일! 50-70컷 격차 큼"),
-        ("Tier 1 (상향 스나이핑)", "가/나", "숭실대", "산업정보시스템공학과", "ssu_nat", 83.0, 5.20, 90.0, "2027 영2=1등급 만점 동일, 추합 꼬리 긺"),
-        ("Tier 1 (상향 스나이핑)", "가/나", "국민대", "미래융합전공(C유형)", "tam1_best_kor_math", 83.5, 6.00, 75.0, "특수 반영비(수학 미반영 등) 유불리"),
-        ("Tier 1 (상향 스나이핑)", "가/나", "국민대", "AI빅데이터융합경영", "std_hum", 84.0, 5.40, 70.0, "국민대 일반 백분위 70컷 최하위권"),
-        ("Tier 1 (상향 스나이핑)", "나군", "단국대(죽전)", "인공지능학과", "dku_nat", 79.0, 5.79, 60.0, "간판 대비 작년 백분위 70컷 79"),
-        ("Tier 1 (상향 스나이핑)", "다군", "단국대(죽전)", "과학교육과", "dku_nat", 76.0, 7.50, 208.0, "충원율 208%, 다군 최저 74 구간"),
-        ("Tier 1 (상향 스나이핑)", "가/나", "인하대", "어문·인문하위", "std_hum", 81.5, 6.10, 85.0, "인하대 인문·어문 막판 추합 스나이핑"),
-        ("Tier 1 (상향 스나이핑)", "가/나", "아주대", "환경안전공학과", "std_nat", 81.0, 7.40, 80.0, "자연계 하위 스나이핑"),
-        ("Tier 1 (상향 스나이핑)", "다군", "아주대", "행정학과", "std_hum", 83.0, 13.30, 110.0, "높은 경쟁률 속 충원 다수 발생"),
-        ("Tier 1 (상향 스나이핑)", "가군", "광운대", "전자융합공학과", "kwu_nat", 81.2, 6.70, 88.9, "영2 감점 2점, 인서울 공대 상향"),
-        ("Tier 1 (상향 스나이핑)", "가군", "광운대", "건축학과", "kwu_nat", 83.3, 6.10, 107.1, "충원율 107.1% 고회전"),
+scored_df = compute_personalized_scores(
+    raw_df, kor_pct, math_pct, tam1_pct, tam2_pct, eng_grade, math_sel, tam_type, apply_bonus, apply_eng
+)
 
-        # Tier 2: 인서울·수도권 탐1·우수순·반영비 개편 주력 (외대글로벌·가톨릭·가천·명지·상명·인천·경기·한성)
-        ("Tier 2 (주력·유리)", "다군", "한국외대(글로벌)", "자유전공학부(글로벌)", "hufs_b", 77.5, 6.20, 110.0, "102명 대규모 + 인문B(수35·영15, 2등급 198점)"),
-        ("Tier 2 (주력·유리)", "가/나", "한국외대(글로벌)", "인문·지역학", "hufs_a", 76.5, 5.80, 75.0, "2027 반영비율 개편 혼선 틈새"),
-        ("Tier 2 (주력·유리)", "다/가", "가톨릭대", "무전공·자전(일반Ⅱ)", "tam1_pick1_433", 79.0, 6.50, 95.0, "국어 삭제! 기하40+영30+세계사30"),
-        ("Tier 2 (주력·유리)", "가군", "가톨릭대", "인문사회계열(일반Ⅰ)", "tam1_best_kor_math", 79.0, 5.50, 70.0, "국수 우수 35/25 + 영20 + 탐(1)20"),
-        ("Tier 2 (주력·유리)", "가/나/다", "가천대", "AI인문·자전(일반1)", "tam1_best3_432", 81.0, 6.20, 85.0, "백분위: 국수 40/30 + 영탐(1) 20/10"),
-        ("Tier 2 (주력·유리)", "가/나/다", "가천대", "경영·공학(일반2)", "tam1_best3_432", 80.5, 6.80, 90.0, "등급 활용(세계사1·영2 교차 계산)"),
-        ("Tier 2 (주력·유리)", "다/나", "한성대", "상상력인재학부", "tam1_best4_4321", 78.5, 7.20, 105.0, "서울권 무전공! 우수순 40/30/20/10"),
-        ("Tier 2 (주력·유리)", "가/나/다", "인천대", "일본지역문화학과", "std_hum", 78.0, 8.20, 163.6, "국립대 + 충원율 163.6% 1위"),
-        ("Tier 2 (주력·유리)", "가/나/다", "인천대", "독어독문학과", "std_hum", 78.0, 7.90, 145.5, "충원율 145.5% 고회전 비인기 어문"),
-        ("Tier 2 (주력·유리)", "가/다", "경기대", "자유전공학부", "tam1_math35", 79.0, 6.40, 80.0, "A/B형 자동 유리적용 + 탐(1)"),
-        ("Tier 2 (주력·유리)", "나/다", "상명대(서울)", "자연·인문", "tam1_nat_giha10", 81.0, 6.10, 75.0, "탐(1) + 자연 기하 10% 가산"),
-        ("Tier 2 (주력·유리)", "가/나/다", "명지대", "인문사회·경영", "tam1_hum", 81.5, 5.90, 70.0, "탐구 1과목(세계사) 반영"),
+# =========================================================
+# Header & Executive KPI Ribbon
+# =========================================================
+st.markdown('<div class="main-header">🎯 2027 정시 전략 시뮬레이터 v3</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub-header">19개 주요 대학(21개 캠퍼스) 2026 최신 입결 + 대교협 2021~2025 5개년 추이 · 대학별 탐구 반영과목수(1 vs 2) 및 반영비율 정밀 계산</div>',
+    unsafe_allow_html=True,
+)
 
-        # Tier 3: 지거국 6개교 정밀 공략 (부산·경북·전남·전북·충남·충북)
-        ("Tier 3 (지거국)", "가군", "부산대", "유아교육과", "pusan_hum", 78.0, 10.50, 133.0, "영2 감점 2점, 한국사+10, 충원 133%"),
-        ("Tier 3 (지거국)", "가군", "부산대", "특수교육과", "pusan_hum", 78.0, 7.00, 83.0, "부산대 가군 하위 컷 + 고회전"),
-        ("Tier 3 (지거국)", "가군", "부산대", "독어독문학과", "pusan_hum", 79.0, 6.09, 64.0, "11명 모집, 사탐2(93%) 강점"),
-        ("Tier 3 (지거국)", "가군", "부산대", "고고학과", "pusan_hum", 80.0, 5.63, 100.0, "충원율 100%, 소신 스나이핑"),
-        ("Tier 3 (지거국)", "나군", "부산대", "사학과", "pusan_hum", 79.0, 6.73, 64.0, "나군 인문 컷 하위권"),
-        ("Tier 3 (지거국)", "가군", "경북대", "사학과", "knu_hum", 78.0, 9.71, 129.0, "영2 -3.75점, 충원 129%"),
-        ("Tier 3 (지거국)", "가군", "경북대", "산림과학조경학부", "knu_nat", 76.0, 7.83, 50.0, "대구캠 자연 사탐 허용"),
-        ("Tier 3 (지거국)", "나군", "경북대", "자율전공학부", "knu_free", 79.0, 4.35, 60.0, "78명 대규모, 국250·수250·영100·탐200"),
-        ("Tier 3 (지거국)", "나군", "경북대", "고고인류학과", "knu_hum", 76.0, 9.00, 0.0, "나군 인문 평균백분위 최저(76)"),
-        ("Tier 3 (지거국)", "나군", "경북대", "경제통상학부", "knu_hum", 78.0, 4.71, 39.0, "28명 대규모 모집"),
-        ("Tier 3 (지거국)", "가/나", "전남대", "정치외교학과", "jnu_hum", 77.0, 6.50, 157.0, "세계사 표점비율 유리(단, 영2 -10점)"),
-        ("Tier 3 (지거국)", "가군", "전남대", "경영학부", "jnu_hum", 78.0, 3.36, 65.0, "56명 대규모 저경쟁(3.36:1)"),
-        ("Tier 3 (지거국)", "가군", "전북대", "국어교육과", "jbnu_hum", 75.0, 5.70, 167.0, "영2 27/30점, 충원율 167%"),
-        ("Tier 3 (지거국)", "가군", "전북대", "농업생명과학계열", "jbnu_hum", 74.0, 6.50, 80.0, "충원 51명 대량 추합"),
-        ("Tier 3 (지거국)", "가군", "충남대", "화학공학교육과", "cnu_hum", 70.0, 4.50, 50.0, "탐구 30% 반영 안정선"),
-        ("Tier 3 (지거국)", "나군", "충남대", "중어중문·언어학과", "cnu_hum", 72.0, 5.00, 55.0, "사탐 평균 93% 안정 방어"),
-        ("Tier 3 (지거국)", "나군", "충북대", "건축공학과", "cbnu_nat", 66.0, 4.13, 60.0, "확실한 안전 방어선"),
-    ]
-    cols = ["티어", "모집군", "대학", "모집단위", "공식키", "작년70컷", "작년경쟁률", "작년충원율", "핵심포인트"]
-    return pd.DataFrame(data, columns=cols)
+simple_avg2 = round((kor_pct + math_pct + (tam1_pct + tam2_pct) / 2) / 3, 2)
+simple_avg1 = round((kor_pct + math_pct + max(tam1_pct, tam2_pct)) / 3, 2)
+tam_diff = round(simple_avg1 - simple_avg2, 2)
 
-def eng_score_pct(grade: int, penalty_level: str = "normal") -> float:
-    # 대학별 영어 2등급 실질 방어력을 백분위 등가로 보정
-    if penalty_level == "zero":  # 숭실대 (2등급=1등급 만점 동일)
-        return {1: 99.0, 2: 99.0, 3: 90.0, 4: 75.0}.get(grade, 50.0)
-    elif penalty_level == "tiny":  # 외대·부산대·경북대·전북대 (2등급 감점 1.5~3.75점)
-        return {1: 99.0, 2: 95.5, 3: 86.0, 4: 70.0}.get(grade, 50.0)
-    elif penalty_level == "heavy":  # 전남대 등 (2등급 감점 10점)
-        return {1: 99.0, 2: 83.0, 3: 70.0, 4: 55.0}.get(grade, 40.0)
-    else:  # 일반 수도권/국립
-        return {1: 98.5, 2: 91.5, 3: 80.0, 4: 65.0}.get(grade, 45.0)
+pass_cnt = scored_df["지원_판정"].isin(["🟢 안정", "🔵 적정"]).sum()
+sos_cnt = (scored_df["지원_판정"] == "🟡 소신").sum()
+yoy_med = scored_df["전년대비_변화"].median()
 
-def calc_v2_score(rule: str, kp: float, mp: float, ks: float, ms: float, eg: int, t1p: float, t2p: float, t1s: float, t2s: float, giha: bool):
-    tb = max(t1p, t2p)
-    ta = (t1p + t2p) / 2.0
-    km_hi, km_lo = max(kp, mp), min(kp, mp)
+k1, k2, k3, k4 = st.columns(4)
+with k1:
+    st.markdown(f"""<div class="kpi-card">
+        <div class="kpi-label">단순 평균 백분위 (탐구2 vs 탐구1)</div>
+        <div class="kpi-value">{simple_avg2:.1f} <span style="font-size:1rem;color:#2563EB;">/ {simple_avg1:.1f}</span></div>
+        <div class="kpi-sub">탐구 1과목 반영 대학 유리폭: <b>+{tam_diff:.2f}%p</b></div>
+    </div>""", unsafe_allow_html=True)
+with k2:
+    st.markdown(f"""<div class="kpi-card">
+        <div class="kpi-label">지원가능권 (안정+적정)</div>
+        <div class="kpi-value">{pass_cnt}개 <span style="font-size:0.95rem;color:#64748B;">/ {len(scored_df)}개 학과</span></div>
+        <div class="kpi-sub">소신 지원권(±1.5%p 내외): <b>{sos_cnt}개 학과</b></div>
+    </div>""", unsafe_allow_html=True)
+with k3:
+    tam1_univs = scored_df[scored_df["탐구_반영과목수"] == 1]["대학명"].nunique()
+    tam2_univs = scored_df[scored_df["탐구_반영과목수"] == 2]["대학명"].nunique()
+    st.markdown(f"""<div class="kpi-card">
+        <div class="kpi-label">분석 대학 커버리지</div>
+        <div class="kpi-value">19개교 <span style="font-size:0.95rem;color:#64748B;">(21캠퍼스)</span></div>
+        <div class="kpi-sub">탐구1과목 {tam1_univs}곳 · 탐구2과목 {tam2_univs}곳</div>
+    </div>""", unsafe_allow_html=True)
+with k4:
+    yoy_str = f"{yoy_med:+.2f}%p" if pd.notna(yoy_med) else "-"
+    st.markdown(f"""<div class="kpi-card">
+        <div class="kpi-label">2025 → 2026 입결 변화(중앙값)</div>
+        <div class="kpi-value">{yoy_str}</div>
+        <div class="kpi-sub">대교협 2025 vs 2026 매칭 학과 기준</div>
+    </div>""", unsafe_allow_html=True)
 
-    # 1) 대학별 체감 백분위 계산
-    if rule == "ssu_hum":
-        ep = eng_score_pct(eg, "zero")
-        eff = kp * 0.35 + mp * 0.25 + ep * 0.20 + ta * 0.20
-    elif rule == "ssu_nat":
-        ep = eng_score_pct(eg, "zero")
-        eff = kp * 0.20 + mp * 0.35 + ep * 0.20 + ta * 0.25
-    elif rule == "hufs_b":
-        ep = eng_score_pct(eg, "tiny")
-        eff = kp * 0.30 + mp * 0.35 + ep * 0.15 + ta * 0.20
-    elif rule == "hufs_a":
-        ep = eng_score_pct(eg, "tiny")
-        eff = kp * 0.30 + mp * 0.30 + ep * 0.20 + ta * 0.20
-    elif rule == "tam1_pick1_433":
-        ep = eng_score_pct(eg, "normal")
-        eff = km_hi * 0.40 + ep * 0.30 + tb * 0.30
-    elif rule == "tam1_best3_432":
-        ep = eng_score_pct(eg, "normal")
-        et_hi, et_lo = max(ep, tb), min(ep, tb)
-        eff = km_hi * 0.40 + km_lo * 0.30 + et_hi * 0.20 + et_lo * 0.10
-    elif rule == "tam1_best4_4321":
-        ep = eng_score_pct(eg, "normal")
-        s = sorted([kp, mp, ep, tb], reverse=True)
-        eff = s[0] * 0.40 + s[1] * 0.30 + s[2] * 0.20 + s[3] * 0.10
-    elif rule == "tam1_best_kor_math":
-        ep = eng_score_pct(eg, "normal")
-        eff = km_hi * 0.35 + km_lo * 0.25 + ep * 0.20 + tb * 0.20
-    elif rule == "tam1_math35":
-        ep = eng_score_pct(eg, "normal")
-        eff = mp * 0.35 + kp * 0.30 + ep * 0.20 + tb * 0.15
-    elif rule == "tam1_hum":
-        ep = eng_score_pct(eg, "normal")
-        eff = kp * 0.35 + mp * 0.25 + ep * 0.20 + tb * 0.20
-    elif rule == "tam1_nat_giha10":
-        ep = eng_score_pct(eg, "normal")
-        m_adj = min(mp * (1.10 if giha else 1.0), 100.0)
-        eff = kp * 0.25 + m_adj * 0.35 + ep * 0.20 + tb * 0.20
-    elif rule == "pusan_hum":
-        ep = eng_score_pct(eg, "tiny")
-        eff = kp * 0.30 + mp * 0.25 + ep * 0.20 + ta * 0.25
-    elif rule == "knu_hum":
-        ep = eng_score_pct(eg, "tiny")
-        eff = (kp * 300 + mp * 200 + ep * 100 + ta * 200) / 800.0
-    elif rule == "knu_free":
-        ep = eng_score_pct(eg, "tiny")
-        eff = (kp * 250 + mp * 250 + ep * 100 + ta * 200) / 800.0
-    elif rule == "knu_nat":
-        ep = eng_score_pct(eg, "tiny")
-        eff = (kp * 200 + mp * 300 + ep * 100 + ta * 200) / 800.0
-    elif rule == "jnu_hum":
-        ep = eng_score_pct(eg, "heavy")
-        eff = kp * 0.30 + mp * 0.20 + ep * 0.20 + ta * 0.30
-    elif rule in ("jbnu_hum", "cnu_hum"):
-        ep = eng_score_pct(eg, "tiny")
-        eff = kp * 0.25 + mp * 0.25 + ep * 0.20 + ta * 0.30
-    elif rule == "cbnu_nat":
-        ep = eng_score_pct(eg, "normal")
-        eff = kp * 0.20 + mp * 0.30 + ep * 0.20 + ta * 0.30
-    elif rule == "kwu_nat":
-        ep = eng_score_pct(eg, "tiny")
-        eff = kp * 0.20 + mp * 0.35 + ep * 0.20 + ta * 0.25
-    elif rule == "dku_nat":
-        ep = eng_score_pct(eg, "normal")
-        eff = kp * 0.20 + mp * 0.35 + ep * 0.15 + ta * 0.30
-    elif rule == "std_nat":
-        ep = eng_score_pct(eg, "normal")
-        eff = kp * 0.20 + mp * 0.35 + ep * 0.20 + ta * 0.25
-    else:
-        ep = eng_score_pct(eg, "normal")
-        eff = (kp + mp + ta) / 3.0
+st.write("")
 
-    # 2) 지거국 실제 1,000점 환산 추정치 (2026 요강 공식 기반)
-    univ_1000 = None
-    t_sum = t1s + t2s
-    if rule == "pusan_hum":
-        e_pt = {1: 200, 2: 198, 3: 195, 4: 190}.get(eg, 185)
-        univ_1000 = round(ks * 1.5 + ms * 1.25 + t_sum * 1.25 + e_pt + 10.0, 2)
-    elif rule.startswith("knu_"):
-        e_pen = {1: 0, 2: -3.75, 3: -10.0, 4: -16.25}.get(eg, -22.5)
-        if rule == "knu_hum":
-            base = (ks * 1.5 + ms * 1.0 + 100.0 + t_sum * 1.0) * 1.25
-        elif rule == "knu_free":
-            base = (ks * 1.25 + ms * 1.25 + 100.0 + t_sum * 1.0) * 1.25
-        else:
-            base = (ks * 1.0 + ms * 1.5 + 100.0 + t_sum * 1.0) * 1.25
-        univ_1000 = round(base + e_pen + 10.0, 2)
-    elif rule == "jnu_hum":
-        # 전국 최고 표점(가정치 국140/수142/탐70) 대비 비율 예시
-        e_pt = {1: 200, 2: 190, 3: 180, 4: 170}.get(eg, 160)
-        univ_1000 = round((ks / 140) * 300 + (ms / 142) * 200 + (t_sum / 140) * 300 + e_pt + 10.0, 2)
-
-    return round(eff, 2), univ_1000
-
-# ---------------------------------------------------------
-# 2. 사이드바: 내 성적 입력 (가채점 기본값 → 12월 실채점 수정)
-# ---------------------------------------------------------
-st.sidebar.header("📝 내 2027 수능 성적표")
-kp = st.sidebar.number_input("국어 (언매) 백분위", 0.0, 100.0, 68.0, 0.5)
-ks = st.sidebar.number_input("국어 표준점수", 50.0, 160.0, 112.0, 1.0)
-mp = st.sidebar.number_input("수학 (기하) 백분위", 0.0, 100.0, 72.5, 0.5)
-ms = st.sidebar.number_input("수학 표준점수", 50.0, 160.0, 116.0, 1.0)
-giha = st.sidebar.checkbox("미적/기하 선택 가산 반영", value=True)
-eg = st.sidebar.selectbox("영어 등급", [1, 2, 3, 4, 5], index=1)
-t1p = st.sidebar.number_input("탐구1 (세계사) 백분위", 0.0, 100.0, 97.5, 0.5)
-t1s = st.sidebar.number_input("탐구1 표준점수", 30.0, 100.0, 68.5, 0.5)
-t2p = st.sidebar.number_input("탐구2 (생윤) 백분위", 0.0, 100.0, 89.0, 0.5)
-t2s = st.sidebar.number_input("탐구2 표준점수", 30.0, 100.0, 61.0, 0.5)
-
-simple_avg = round((kp + mp + (t1p + t2p) / 2.0) / 3.0, 2)
-st.sidebar.divider()
-st.sidebar.metric("국수탐(2) 단순 평균", f"{simple_avg}%")
-st.sidebar.metric("국수탐(2) 표점 합", f"{round(ks + ms + t1s + t2s, 1)}점")
-
-# ---------------------------------------------------------
-# 3. 메인 계산 & 세션 DB 관리
-# ---------------------------------------------------------
-if "custom_df" not in st.session_state:
-    st.session_state.custom_df = load_v2_targets().copy()
-
-df = st.session_state.custom_df.copy()
-res = df["공식키"].apply(lambda r: calc_v2_score(r, kp, mp, ks, ms, eg, t1p, t2p, t1s, t2s, giha))
-df["내체감백분위"] = [x[0] for x in res]
-df["추정환산(1000)"] = [x[1] for x in res]
-df["마진"] = (df["내체감백분위"] - df["작년70컷"]).round(2)
-df["스나이핑지수"] = (df["마진"] + (df["작년충원율"] / 100.0) * 1.5).round(2)
-
-def judge(m):
-    if m >= 2.0:
-        return "🟢 안정/적정"
-    elif m >= -1.0:
-        return "🟡 소신/적정"
-    elif m >= -4.0:
-        return "🟠 스나이핑"
-    else:
-        return "🔴 초상향"
-
-df["판정"] = df["마진"].apply(judge)
-
-st.title("🎯 2027 정시 스나이퍼 v2 (20개 대학 정밀 엔진)")
-
-t1, t2, t3, t4 = st.tabs([
-    "📊 20개 대학 유불리·편집",
-    "🩻 진학사 표본 X-레이",
-    "📡 20개 대학 일괄 크롤러",
-    "🌪️ 전국 CSV 깔때기",
+# =========================================================
+# Tabs
+# =========================================================
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 19개 대학 통합 배치 & 맞춤 판정",
+    "🧩 가·나·다군 3장 포트폴리오 조합기",
+    "📈 5개년 추이 & 권역별 포지셔닝",
+    "🔍 데이터 기준 & 출처 X-Ray",
 ])
 
-with t1:
-    c1, c2, c3 = st.columns(3)
-    f_tier = c1.multiselect("티어", df["티어"].unique(), default=list(df["티어"].unique()))
-    f_gun = c2.multiselect("모집군", df["모집군"].unique(), default=list(df["모집군"].unique()))
-    f_judge = c3.multiselect("판정", df["판정"].unique(), default=list(df["판정"].unique()))
+# ---------------------------------------------------------
+# TAB 1: Integrated Dashboard
+# ---------------------------------------------------------
+with tab1:
+    f1, f2, f3, f4, f5 = st.columns([1.2, 1.5, 1.0, 1.1, 1.2])
+    with f1:
+        sel_regions = st.multiselect("권역", sorted(scored_df["권역"].unique()), default=sorted(scored_df["권역"].unique()))
+    with f2:
+        avail_univs = sorted(scored_df[scored_df["권역"].isin(sel_regions)]["대학명"].unique())
+        sel_univs = st.multiselect("대학 선택", avail_univs, default=avail_univs)
+    with f3:
+        sel_guns = st.multiselect("모집군", ["가", "나", "다", "미상"], default=["가", "나", "다"])
+    with f4:
+        sel_tracks = st.multiselect("계열", sorted(scored_df["계열"].unique()), default=["인문", "자연", "자율/무전공", "의약학/보건"])
+    with f5:
+        sel_tiers = st.multiselect("판정 구간", ["🟢 안정", "🔵 적정", "🟡 소신", "🟠 상향", "🔴 위험"], default=["🟢 안정", "🔵 적정", "🟡 소신", "🟠 상향"])
 
-    vdf = df[df["티어"].isin(f_tier) & df["모집군"].isin(f_gun) & df["판정"].isin(f_judge)].sort_values("스나이핑지수", ascending=False)
+    search_kw = st.text_input("🔎 학과명 키워드 검색 (예: 컴퓨터, 전자, 경영, 간호, 자율)", "")
 
-    fig = px.scatter(
-        vdf,
-        x="작년70컷",
-        y="내체감백분위",
-        size="작년충원율",
-        color="판정",
-        hover_name="대학",
-        hover_data=["모집단위", "모집군", "마진", "스나이핑지수", "추정환산(1000)"],
-        title="20개 대학 42+ 정예 학과 포지셔닝 (점선 위 = 작년 70컷 초과)",
-    )
-    fig.add_shape(type="line", x0=65, y0=65, x1=86, y1=86, line=dict(color="gray", dash="dash"))
-    st.plotly_chart(fig, use_container_width=True)
+    fdf = scored_df[
+        scored_df["권역"].isin(sel_regions)
+        & scored_df["대학명"].isin(sel_univs)
+        & scored_df["모집군"].isin(sel_guns)
+        & scored_df["계열"].isin(sel_tracks)
+        & scored_df["지원_판정"].isin(sel_tiers)
+    ].copy()
 
-    st.dataframe(
-        vdf[["판정", "티어", "모집군", "대학", "모집단위", "내체감백분위", "작년70컷", "마진", "작년충원율", "스나이핑지수", "추정환산(1000)", "핵심포인트"]],
-        use_container_width=True,
-        hide_index=True,
-    )
+    if search_kw.strip():
+        fdf = fdf[fdf["모집단위"].str.contains(search_kw.strip(), case=False, na=False)]
 
-    with st.expander("➕ 학과 직접 추가하기 (12월 수시 이월·추가 학과 입력용)"):
-        with st.form("add_dept_form"):
-            fc1, fc2, fc3, fc4 = st.columns(4)
-            n_tier = fc1.selectbox("티어", ["Tier 1 (상향 스나이핑)", "Tier 2 (주력·유리)", "Tier 3 (지거국)"])
-            n_gun = fc2.selectbox("모집군", ["가군", "나군", "다군"])
-            n_univ = fc3.text_input("대학명", placeholder="예: 숭실대")
-            n_dept = fc4.text_input("모집단위", placeholder="예: 철학과")
-            fc5, fc6, fc7, fc8 = st.columns(4)
-            n_rule = fc5.selectbox("반영공식", ["std_hum", "std_nat", "ssu_hum", "hufs_b", "tam1_best3_432", "tam1_pick1_433", "pusan_hum", "knu_hum", "jnu_hum"])
-            n_cut = fc6.number_input("작년70컷(%)", 50.0, 99.0, 78.0, 0.5)
-            n_comp = fc7.number_input("작년경쟁률", 0.0, 50.0, 5.0, 0.1)
-            n_turn = fc8.number_input("작년충원율(%)", 0.0, 500.0, 80.0, 5.0)
-            n_note = st.text_input("메모", placeholder="특이사항 메모")
-            if st.form_submit_button("리스트에 추가") and n_univ and n_dept:
-                new_row = pd.DataFrame([[n_tier, n_gun, n_univ, n_dept, n_rule, n_cut, n_comp, n_turn, n_note]], columns=st.session_state.custom_df.columns)
-                st.session_state.custom_df = pd.concat([st.session_state.custom_df, new_row], ignore_index=True)
-                st.success(f"{n_univ} {n_dept} 추가 완료!")
-                st.rerun()
+    st.caption(f"검색 결과: **{len(fdf)}개** 모집단위 (정렬: 적정/안정 격차 순)")
 
-with t2:
-    st.subheader("진학사 표본 복붙 X-레이 v2 (허수·공포 이탈 시뮬레이터)")
-    col_a, col_b = st.columns([2, 1])
-    raw_txt = col_a.text_area("진학사 표본 화면 드래그 복사(Ctrl+C) 후 붙여넣기", height=240)
-    quota = col_b.number_input("정시 모집인원(명)", 1, 200, 12)
-    my_rank = col_b.number_input("모의지원 내 현재 등수", 1, 500, 16)
-    esc_upper = col_b.slider("상위 대학 추합으로 빠질 허수 (%)", 0, 80, 30, 5)
-    fear_drop = col_b.slider("4칸 경계선 공포로 도망갈 표본 (%)", 0, 50, 15, 5)
+    if fdf.empty:
+        st.warning("선택한 필터 조건에 맞는 모집단위가 없습니다. 필터를 넓혀 보세요.")
+    else:
+        plot_df = fdf.copy()
+        plot_df["버블크기"] = plot_df["충원율"].fillna(50).clip(20, 300)
 
-    total_drop = min(0.90, (esc_upper + fear_drop) / 100.0)
-    real_rank = round(max(0.0, (my_rank - 1) * (1.0 - total_drop)) + 1, 1)
+        fig = px.scatter(
+            plot_df,
+            x="백분위_70컷_2026",
+            y="내_맞춤_백분위",
+            color="지원_판정",
+            color_discrete_map=TIER_COLORS,
+            size="버블크기",
+            size_max=18,
+            hover_name="모집단위",
+            hover_data={
+                "대학명": True,
+                "모집군": True,
+                "계열": True,
+                "백분위_70컷_2026": ":.2f",
+                "내_맞춤_백분위": ":.2f",
+                "격차": ":+.2f",
+                "경쟁률": ":.2f",
+                "충원율": ":.1f",
+                "탐구_반영과목수": True,
+                "버블크기": False,
+            },
+            title="2026 입결 70%컷 vs 내 맞춤 체감 백분위 (대각선 위쪽 = 합격 유리권)",
+            height=520,
+        )
+        min_v = max(55, min(plot_df["백분위_70컷_2026"].min(), plot_df["내_맞춤_백분위"].min()) - 2)
+        max_v = min(100, max(plot_df["백분위_70컷_2026"].max(), plot_df["내_맞춤_백분위"].max()) + 2)
+        fig.add_shape(
+            type="line", x0=min_v, y0=min_v, x1=max_v, y1=max_v,
+            line=dict(color="#64748B", width=1.5, dash="dash")
+        )
+        fig.update_layout(
+            xaxis_title="2026학년도 입결 70%컷 (백분위)",
+            yaxis_title="내 대학별 맞춤 체감 백분위",
+            legend_title="지원 판정",
+            plot_bgcolor="#FFFFFF",
+            margin=dict(l=20, r=20, t=50, b=20),
+        )
+        fig.update_xaxes(showgrid=True, gridcolor="#F1F5F9")
+        fig.update_yaxes(showgrid=True, gridcolor="#F1F5F9")
+        st.plotly_chart(fig, use_container_width=True)
 
-    m1, m2 = st.columns(2)
-    m1.metric("이탈 보정 실질 예상 등수", f"{real_rank}등 / {quota}명", delta="합격권 진입!" if real_rank <= quota else f"+{round(real_rank - quota, 1)}명 초과")
-    if raw_txt.strip():
-        scores = [float(x) for x in re.findall(r"\b\d{3}\.\d+\b", raw_txt)]
-        m2.metric("추출된 표본 환산점수 개수", f"{len(scores)}개")
-        if scores:
-            st.caption(f"표본 최고점: {max(scores)} / 평균: {round(sum(scores)/len(scores), 2)} / 최저점: {min(scores)}")
+        disp_cols = [
+            "지원_판정", "대학명", "모집군", "계열", "모집단위",
+            "백분위_70컷_2026", "내_맞춤_백분위", "격차",
+            "백분위_70컷_2025", "전년대비_변화", "모집인원", "경쟁률", "충원순위", "충원율",
+            "탐구_반영과목수", "백분위_기준"
+        ]
+        show_df = fdf[disp_cols].sort_values(by=["격차", "백분위_70컷_2026"], ascending=[False, False]).reset_index(drop=True)
+        st.dataframe(
+            show_df,
+            use_container_width=True,
+            height=450,
+            column_config={
+                "백분위_70컷_2026": st.column_config.NumberColumn("2026 70%컷", format="%.2f"),
+                "내_맞춤_백분위": st.column_config.NumberColumn("내 체감점수", format="%.2f"),
+                "격차": st.column_config.NumberColumn("점수차", format="%+.2f"),
+                "백분위_70컷_2025": st.column_config.NumberColumn("2025 70%컷", format="%.2f"),
+                "전년대비_변화": st.column_config.NumberColumn("전년대비", format="%+.2f"),
+                "경쟁률": st.column_config.NumberColumn("경쟁률", format="%.2f:1"),
+                "충원율": st.column_config.NumberColumn("충원율", format="%.1f%%"),
+            }
+        )
 
-with t3:
-    st.subheader("📡 20개 대학 실시간 경쟁률 일괄 크롤러 & 가속도 모니터")
-    st.caption("1월 4~6일 원서접수 기간에 진학사/유웨이 실시간 경쟁률 URL을 아래 표에 넣고 '전체 스캔'을 누르면 한 번에 긁어옵니다.")
+# ---------------------------------------------------------
+# TAB 2: 가/나/다군 3-Card Portfolio Builder
+# ---------------------------------------------------------
+with tab2:
+    st.markdown('<div class="badge-info">정시는 <b>가군 1장 + 나군 1장 + 다군 1장</b> 총 3장의 카드를 씁니다. 각 군에서 내 성적에 맞는 상향/적정/안정 조합을 시뮬레이션하세요.</div>', unsafe_allow_html=True)
 
-    if "url_df" not in st.session_state:
-        st.session_state.url_df = pd.DataFrame({
-            "대학명": ["숭실대", "단국대", "부산대", "경북대", "가천대"],
-            "경쟁률URL": ["", "", "", "", ""],
-        })
-    if "crawl_logs" not in st.session_state:
-        st.session_state.crawl_logs = []
+    p_col1, p_col2, p_col3 = st.columns(3)
+    with p_col1:
+        p_tracks = st.multiselect("희망 계열(포트폴리오)", sorted(scored_df["계열"].unique()), default=["자연", "인문", "자율/무전공"], key="pt_tr")
+    with p_col2:
+        p_kw = st.text_input("선호 학과 키워드 (쉼표로 복수 입력 가능)", "", placeholder="예: 컴퓨터, 전자, 소프트웨어, 경영")
+    with p_col3:
+        strategy = st.selectbox("추천 조합 전략", [
+            "밸런스형 (1상향/소신 + 1적정 + 1안정)",
+            "공격형 (2상향/소신 + 1적정)",
+            "안정 추구형 (1적정 + 2안정)",
+        ])
 
-    edited_urls = st.data_editor(st.session_state.url_df, num_rows="dynamic", use_container_width=True)
-    st.session_state.url_df = edited_urls
+    pool = scored_df[scored_df["계열"].isin(p_tracks) & scored_df["모집군"].isin(["가", "나", "다"])].copy()
+    if p_kw.strip():
+        kws = [k.strip() for k in p_kw.split(",") if k.strip()]
+        pattern = "|".join(kws)
+        pool = pool[pool["모집단위"].str.contains(pattern, case=False, na=False)]
 
-    if st.button("🚀 등록된 URL 전체 실시간 스캔 실행", type="primary"):
-        now_str = datetime.now().strftime("%m/%d %H:%M")
-        valid_rows = edited_urls[edited_urls["경쟁률URL"].astype(str).str.startswith("http")]
-        if valid_rows.empty:
-            st.warning("최소 1개 이상의 http로 시작하는 실제 경쟁률 페이지 URL을 입력해 주세요.")
+    # Pick best candidates per 군 and tier
+    def pick_candidate(gun, target_tiers):
+        sub = pool[(pool["모집군"] == gun) & (pool["지원_판정"].isin(target_tiers))].copy()
+        if sub.empty:
+            sub = pool[pool["모집군"] == gun].copy()
+        if sub.empty:
+            return pd.DataFrame()
+        # Sort by closeness to ideal gap (for 상향/소신: highest gap in tier; for 안정: highest 70%cut)
+        return sub.sort_values(by=["격차", "충원율"], ascending=[False, False]).head(12)
+
+    if "밸런스형" in strategy:
+        tier_map = {"가": ["🟡 소신", "🟠 상향"], "나": ["🔵 적정"], "다": ["🟢 안정", "🔵 적정"]}
+    elif "공격형" in strategy:
+        tier_map = {"가": ["🟠 상향", "🟡 소신"], "나": ["🟡 소신", "🟠 상향"], "다": ["🔵 적정", "🟡 소신"]}
+    else:
+        tier_map = {"가": ["🔵 적정", "🟢 안정"], "나": ["🟢 안정"], "다": ["🟢 안정"]}
+
+    g_cols = st.columns(3)
+    selected_cards = []
+    for col, gun in zip(g_cols, ["가", "나", "다"]):
+        with col:
+            st.markdown(f"#### 🎯 {gun}군 후보")
+            cand = pick_candidate(gun, tier_map[gun])
+            if cand.empty:
+                st.info(f"{gun}군에 조건을 만족하는 학과가 없습니다.")
+            else:
+                cand["라벨"] = cand.apply(lambda r: f"{r['지원_판정']} {r['대학명']} · {r['모집단위']} (컷 {r['백분위_70컷_2026']:.1f} / 격차 {r['격차']:+.1f})", axis=1)
+                choice = st.selectbox(f"{gun}군 선택", cand["라벨"].tolist(), key=f"sel_{gun}")
+                row = cand[cand["라벨"] == choice].iloc[0]
+                selected_cards.append(row)
+                st.metric("내 체감점수 vs 2026 70%컷", f"{row['내_맞춤_백분위']:.2f}", f"{row['격차']:+.2f}%p")
+                st.write(f"- **모집인원 / 경쟁률**: {int(row['모집인원']) if pd.notna(row['모집인원']) else '-'}명 / {row['경쟁률']:.2f}:1" if pd.notna(row['경쟁률']) else "- **경쟁률**: 미공개")
+                st.write(f"- **충원순위 / 충원율**: {int(row['충원순위']) if pd.notna(row['충원순위']) else '-'}번 / {row['충원율']:.1f}%" if pd.notna(row['충원율']) else "- **충원**: 미공개")
+                st.write(f"- **탐구반영**: {int(row['탐구_반영과목수'])}과목")
+
+    if selected_cards:
+        st.divider()
+        port_df = pd.DataFrame(selected_cards)
+        fig_p = go.Figure()
+        fig_p.add_trace(go.Bar(
+            name="2026 70%컷",
+            x=[f"{r['모집군']}군: {r['대학명']} {r['모집단위']}" for _, r in port_df.iterrows()],
+            y=port_df["백분위_70컷_2026"],
+            marker_color="#94A3B8"
+        ))
+        fig_p.add_trace(go.Bar(
+            name="내 맞춤 체감 백분위",
+            x=[f"{r['모집군']}군: {r['대학명']} {r['모집단위']}" for _, r in port_df.iterrows()],
+            y=port_df["내_맞춤_백분위"],
+            marker_color="#2563EB"
+        ))
+        fig_p.update_layout(
+            barmode="group",
+            title="선택한 가·나·다군 3장 포트폴리오 비교",
+            yaxis_title="백분위",
+            yaxis_range=[max(50, port_df["백분위_70컷_2026"].min() - 10), 100],
+            height=360,
+        )
+        st.plotly_chart(fig_p, use_container_width=True)
+
+# ---------------------------------------------------------
+# TAB 3: 5-Year Trend & University Positioning
+# ---------------------------------------------------------
+with tab3:
+    t_col1, t_col2 = st.columns([1.2, 2.0])
+    with t_col1:
+        st.markdown("#### 🔍 학과별 2021~2026 6개년 추이")
+        u_sel = st.selectbox("대학 선택", sorted(scored_df["대학명"].unique()), key="tr_u")
+        u_sub = scored_df[scored_df["대학명"] == u_sel]
+        d_sel = st.selectbox("모집단위 선택", sorted(u_sub["모집단위"].unique()), key="tr_d")
+        d_row = u_sub[u_sub["모집단위"] == d_sel].iloc[0]
+
+        yrs = ["2021", "2022", "2023", "2024", "2025", "2026"]
+        vals = [
+            d_row.get("백분위_70컷_2021", np.nan),
+            d_row.get("백분위_70컷_2022", np.nan),
+            d_row.get("백분위_70컷_2023", np.nan),
+            d_row.get("백분위_70컷_2024", np.nan),
+            d_row.get("백분위_70컷_2025", np.nan),
+            d_row.get("백분위_70컷_2026", np.nan),
+        ]
+        tr_df = pd.DataFrame({"학년도": yrs, "70%컷": vals}).dropna()
+        if len(tr_df) >= 2:
+            fig_t = px.line(tr_df, x="학년도", y="70%컷", markers=True, title=f"{u_sel} {d_sel} 연도별 70%컷 추이")
+            fig_t.add_hline(y=d_row["내_맞춤_백분위"], line_dash="dash", line_color="#2563EB", annotation_text=f"내 점수 ({d_row['내_맞춤_백분위']:.1f})")
+            fig_t.update_layout(height=350, yaxis_range=[max(50, tr_df["70%컷"].min()-5), 100])
+            st.plotly_chart(fig_t, use_container_width=True)
         else:
-            for _, row in valid_rows.iterrows():
-                u_name, u_url = row["대학명"], row["경쟁률URL"]
-                try:
-                    r = requests.get(u_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-                    tables = pd.read_html(r.text)
-                    st.success(f"[{now_str}] {u_name}: 표 {len(tables)}개 수집 성공!")
-                    st.dataframe(tables[0].head(10), use_container_width=True)
-                    st.session_state.crawl_logs.append({"시간": now_str, "대학": u_name, "상태": "성공", "표개수": len(tables)})
-                except Exception as e:
-                    st.error(f"{u_name} 수집 실패: {e}")
+            st.info(f"2026 70%컷: **{d_row['백분위_70컷_2026']:.2f}** (대교협 과거 연도 동일 학과명 매칭 없음)")
 
-with t4:
-    st.subheader("전국 입결 CSV 일괄 스캐너")
-    up = st.file_uploader("CSV 업로드", type=["csv"])
-    lo, hi = st.slider("백분위 70%컷 범위", 50.0, 99.0, (70.0, 85.0), 0.5)
-    if up is not None:
-        rdf = pd.read_csv(up)
-        col = st.selectbox("백분위 열 선택", rdf.columns)
-        fdf = rdf[(pd.to_numeric(rdf[col], errors="coerce") >= lo) & (pd.to_numeric(rdf[col], errors="coerce") <= hi)]
-        st.dataframe(fdf, use_container_width=True)
+    with t_col2:
+        st.markdown("#### 🏫 19개 대학 2026 입결 분포 비교 (계열별)")
+        bx_track = st.radio("비교 계열", ["전체(예체능 제외)", "인문", "자연", "자율/무전공"], horizontal=True)
+        bx_df = scored_df[scored_df["계열"] != "예체능"] if bx_track == "전체(예체능 제외)" else scored_df[scored_df["계열"] == bx_track]
+        order_u = bx_df.groupby("대학명")["백분위_70컷_2026"].median().sort_values(ascending=False).index.tolist()
+        fig_b = px.box(
+            bx_df,
+            x="대학명",
+            y="백분위_70컷_2026",
+            color="권역",
+            category_orders={"대학명": order_u},
+            title=f"대학별 2026 70%컷 분포 ({bx_track})",
+            height=430,
+        )
+        fig_b.add_hline(y=simple_avg2, line_dash="dot", line_color="#DC2626", annotation_text=f"내 단순평균(탐2): {simple_avg2:.1f}")
+        fig_b.update_layout(xaxis_tickangle=-35, yaxis_title="백분위 70%컷")
+        st.plotly_chart(fig_b, use_container_width=True)
+
+# ---------------------------------------------------------
+# TAB 4: Data Transparency & Audit
+# ---------------------------------------------------------
+with tab4:
+    st.markdown("#### 🔍 대학별 데이터 기준 · 탐구 반영과목수 · 출처 감사")
+    audit_df = scored_df.groupby(["대학명", "권역", "탐구_반영과목수", "백분위_기준", "데이터_출처"], as_index=False).agg(
+        모집단위수=("모집단위", "count"),
+        평균_70컷=("백분위_70컷_2026", "mean"),
+        최저_70컷=("백분위_70컷_2026", "min"),
+        최고_70컷=("백분위_70컷_2026", "max"),
+        전년매칭수=("백분위_70컷_2025", lambda s: s.notna().sum()),
+    ).sort_values(by="평균_70컷", ascending=False)
+    st.dataframe(audit_df, use_container_width=True, hide_index=True)
+
+    st.download_button(
+        label="📥 통합 마스터 데이터셋 CSV 다운로드 (univ_2026_master.csv)",
+        data=scored_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="univ_2026_master_scored.csv",
+        mime="text/csv",
+    )
