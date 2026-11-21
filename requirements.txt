@@ -1,6 +1,7 @@
-streamlit
-pandas
-plotly
-beautifulsoup4
-requests
-openpyxl
+streamlit>=1.36.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.18.0streamlit>=1.36.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.18.0
