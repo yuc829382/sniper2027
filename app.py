@@ -20,44 +20,44 @@ st.markdown("""
     .main-header {
         font-size: 1.85rem;
         font-weight: 800;
-        color: #0F172A;
+        color: inherit;
         letter-spacing: -0.02em;
         margin-bottom: 0.25rem;
     }
     .sub-header {
         font-size: 0.95rem;
-        color: #475569;
+        opacity: 0.78;
         margin-bottom: 1.25rem;
     }
     .kpi-card {
-        background: #F8FAFC;
-        border: 1px solid #E2E8F0;
+        background: rgba(148, 163, 184, 0.12);
+        border: 1px solid rgba(148, 163, 184, 0.28);
         border-radius: 12px;
         padding: 14px 18px;
     }
     .kpi-label {
         font-size: 0.80rem;
-        color: #64748B;
+        opacity: 0.72;
         font-weight: 600;
         margin-bottom: 4px;
     }
     .kpi-value {
         font-size: 1.45rem;
-        color: #0F172A;
+        color: inherit;
         font-weight: 800;
     }
     .kpi-sub {
         font-size: 0.76rem;
-        color: #475569;
+        opacity: 0.78;
         margin-top: 2px;
     }
     .badge-info {
-        background-color: #EFF6FF;
-        border-left: 4px solid #2563EB;
+        background-color: rgba(37, 99, 235, 0.14);
+        border-left: 4px solid #3B82F6;
         padding: 10px 14px;
         border-radius: 6px;
         font-size: 0.88rem;
-        color: #1E3A8A;
+        color: inherit;
         margin-bottom: 12px;
     }
 </style>
@@ -223,7 +223,7 @@ with k3:
     tam2_univs = scored_df[scored_df["탐구_반영과목수"] == 2]["대학명"].nunique()
     st.markdown(f"""<div class="kpi-card">
         <div class="kpi-label">분석 대학 커버리지</div>
-        <div class="kpi-value">19개교 <span style="font-size:0.95rem;color:#64748B;">(21캠퍼스)</span></div>
+        <div class="kpi-value">19개교 <span style="font-size:0.95rem;opacity:0.7;">({scored_df["대학명"].nunique()}캠퍼스)</span></div>
         <div class="kpi-sub">탐구1과목 {tam1_univs}곳 · 탐구2과목 {tam2_univs}곳</div>
     </div>""", unsafe_allow_html=True)
 with k4:
@@ -371,15 +371,23 @@ with tab2:
         pattern = "|".join(kws)
         pool = pool[pool["모집단위"].str.contains(pattern, case=False, na=False)]
 
-    # Pick best candidates per 군 and tier
+    # 지방/캠퍼스 제외 옵션 (기본: 본캠 우선)
+    p_regions = st.multiselect(
+        "희망 권역(포트폴리오)",
+        sorted(scored_df["권역"].unique()),
+        default=[r for r in sorted(scored_df["권역"].unique()) if r not in ("지방/캠퍼스", "지방/충청")],
+        key="pt_reg"
+    )
+    pool = pool[pool["권역"].isin(p_regions)].copy()
+
+    # Pick best candidates per 군 and tier (높은 70%컷 우선 정렬 → 쓸데없이 낮은 점수대 추천 방지)
     def pick_candidate(gun, target_tiers):
         sub = pool[(pool["모집군"] == gun) & (pool["지원_판정"].isin(target_tiers))].copy()
         if sub.empty:
             sub = pool[pool["모집군"] == gun].copy()
         if sub.empty:
             return pd.DataFrame()
-        # Sort by closeness to ideal gap (for 상향/소신: highest gap in tier; for 안정: highest 70%cut)
-        return sub.sort_values(by=["격차", "충원율"], ascending=[False, False]).head(12)
+        return sub.sort_values(by=["백분위_70컷_2026", "충원율"], ascending=[False, False]).head(15)
 
     if "밸런스형" in strategy:
         tier_map = {"가": ["🟡 소신", "🟠 상향"], "나": ["🔵 적정"], "다": ["🟢 안정", "🔵 적정"]}
